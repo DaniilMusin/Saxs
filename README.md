@@ -132,7 +132,7 @@ Two instrument setups are randomly selected for each curve:
 | Instrument | q-range (Å⁻¹) | Beam FWHM | Flux (ph/s) | Purpose |
 |------------|---------------|-----------|-------------|---------|
 | **Xeuss 1800HR** | 0.0031-0.149 | 0.0016 | 3.43×10⁶ | Low q, high resolution |
-| **NanoInXider HR** | 0.0025-0.12 | 0.0012 | 2.8×10⁶ | Wide q range |
+| **NanoInXider HR** | 0.0019-0.445 | 0.0012 | 7.22×10⁶ | Wide q range |
 
 ## Output Format
 
