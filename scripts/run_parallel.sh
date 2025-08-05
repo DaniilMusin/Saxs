@@ -72,7 +72,7 @@ process_batch() {
     
     # Use semaphore to control ATSAS license access
     # This ensures only ATSAS_PARALLEL processes use ATSAS at once
-    sem --id atsas_lock -j "$ATSAS_PARALLEL" python scripts/generate_batch.py \
+    sem --id atsas_lock -j "$ATSAS_PARALLEL" python "$(dirname "$0")/generate_batch.py" \
         --start-uid "$start_uid" \
         --end-uid "$end_uid" \
         --output "$OUTPUT_DIR" \

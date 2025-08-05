@@ -57,13 +57,7 @@ echo "Python dependencies installed"
 
 # Create directory structure
 echo "Creating directory structure..."
-mkdir -p configs masks scripts dataset/{saxs,logs,temp}
-
-# Create detector mask if not exists
-if [ ! -f "masks/eiger1m.msk" ]; then
-    echo "Creating default detector mask..."
-    python scripts/create_mask.py --output masks/eiger1m.msk
-fi
+mkdir -p configs scripts dataset/{saxs,logs,temp}
 
 # Make scripts executable
 chmod +x scripts/*.py scripts/*.sh 2>/dev/null || true
@@ -78,13 +72,12 @@ fi
 
 # Test ATSAS functionality
 echo -n "Testing ATSAS functionality... "
-if python scripts/check_atsas.py > /dev/null 2>&1; then
+if command -v bodies >/dev/null 2>&1 && command -v imsim >/dev/null 2>&1; then
     echo "OK"
-else:
+else
     echo "ISSUES DETECTED"
-    echo "Run 'python scripts/check_atsas.py' for details"
-    echo "ATSAS tools are in PATH but may not be functioning correctly"
-    echo "Check your ATSAS installation and license"
+    echo "ATSAS tools not found in PATH"
+    echo "Check your ATSAS installation and ensure tools are in PATH"
 fi
 
 # Summary
@@ -96,8 +89,8 @@ echo "To generate a dataset:"
 echo "  1. Activate the virtual environment:"
 echo "     source venv/bin/activate"
 echo ""
-echo "  2. Check ATSAS installation:"
-echo "     python scripts/check_atsas.py"
+echo "  2. Test the generator (small test):"
+echo "     python scripts/generate.py --n 10 --jobs 1 --out test/"
 echo ""
 echo "  3. Run the generator:"
 echo "     python scripts/generate.py --n 1000 --jobs 4 --atsas-parallel 2 --out dataset/"
@@ -109,8 +102,7 @@ echo "  5. Check data quality:"
 echo "     python scripts/check_quality.py dataset/"
 echo ""
 echo "  6. See interactive examples:"
-echo "     python scripts/demo_interactive.py"
+echo "     python scripts/example_usage.py"
 echo ""
 echo "Configuration files are in: configs/"
-echo "Detector masks are in: masks/"
 echo "Output will be saved to: dataset/"
