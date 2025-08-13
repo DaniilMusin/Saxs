@@ -3,3 +3,6 @@ numpy>=1.21.0
 pyyaml>=5.4.0
 tqdm>=4.62.0
 matplotlib>=3.4.0
+fabio>=0.13.0
+pyfai>=2024.5
+wexpect>=4.0.0

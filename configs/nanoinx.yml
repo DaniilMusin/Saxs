@@ -1,33 +1,8 @@
-# Configuration for NanoInXider HR instrument
-# Used by imsim for detector simulation
-
-instrument:
-  name: "NanoInXider HR"
-  type: "SAXS"
-  
-source:
-  wavelength: 1.54  # Angstrom (Cu K-alpha)
-  flux: 2.8e6       # photons/second
-  
-beam:
-  fwhm: 0.0012      # FWHM in q-space (A^-1)
-  shape: "gaussian"
-  
-detector:
-  name: "Dectris Pilatus 200K"
-  sdd: 2400         # Sample-to-detector distance (mm)
-  pixel_size: 0.172 # mm
-  nx: 487           # pixels
-  ny: 407           # pixels
-  
-q_range:
-  min: 0.0025       # A^-1
-  max: 0.12         # A^-1
-  
-exposure:
-  time: 1800        # seconds (30 minutes)
-  
-noise:
-  dark_current: 0.05 # counts/pixel/second
-  readout_noise: 1.8
-  quantum_efficiency: 0.96
+# configs/nanoinx.yml
+name: NanoInXiderHR
+detector: Eiger1M
+detector_distance_m: 0.938
+wavelength_A: 1.54
+flux_ph_s: 7.22e6
+exposure_s: 1200
+beamstop_mask: masks/eiger1m.msk

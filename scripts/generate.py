@@ -1,595 +1,414 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
-generate.py - Main orchestrator for SAXS dataset generation using ATSAS
-=======================================================================
-
-This script implements the complete pipeline as specified in the technical requirements:
-1. Generate theoretical scattering curves using 'bodies' (predict mode) or 'mixtures'
-2. Simulate detector images using 'imsim'
-3. Convert to 1D curves using 'im2dat'
-
-Updated to address ATSAS limitations:
-- bodies works interactively, not via CLI flags
-- Core-shell structures require mixtures, not bodies
-- Polydispersity is handled by mixtures, not bodies
+Orchestrator: bodies -> crysol -> imsim -> im2dat
+Writes ATSAS-style *.dat (q, I, sigma) and meta.csv.
 """
-
-import argparse
-import json
-import os
-import logging
-import subprocess
-import tempfile
+from __future__ import annotations
+import argparse, json, os, random, sys, tempfile, time, math, shutil
 from pathlib import Path
-from typing import Dict, List, Tuple, Optional
-import numpy as np
+from typing import List, Dict, Any, Iterable, Tuple
 import pandas as pd
-from datetime import datetime
-import yaml
-from concurrent.futures import ProcessPoolExecutor, as_completed
-from tqdm import tqdm
-import hashlib
-import time
 
+from atsas_cli import which_or_die, run, run_crysol, run_im2dat, build_imsim_args, convert_int_to_dat
+from instrument_cfg import Instrument
+from param_sampler import draw_shape, available_shapes
 
-# Shape specifications matching Monge 2024
-# Updated to reflect actual ATSAS capabilities
-SHAPE_SPECS = {
-    'sphere': {
-        'generator': 'bodies',
-        'body_type': 7,  # Hollow sphere with r_inner=0
-        'params': {
-            'radius': {'type': 'log', 'range': (50, 1000)}
-        },
-        'polydispersity': True
-    },
-    'cylinder': {
-        'generator': 'bodies',
-        'body_type': 3,  # Cylinder
-        'params': {
-            'radius': {'type': 'log', 'range': (50, 1000)},
-            'length': {'type': 'relative', 'range': (1.0, 2.0), 'base': 'radius'}
-        },
-        'polydispersity': True
-    },
-    'oblate': {
-        'generator': 'bodies',
-        'body_type': 1,  # Ellipsoid
-        'params': {
-            'a': {'type': 'log', 'range': (50, 1000)},  # equatorial
-            'c_over_a': {'type': 'linear', 'range': (0.1, 0.77)}
-        },
-        'polydispersity': True
-    },
-    'prolate': {
-        'generator': 'bodies',
-        'body_type': 1,  # Ellipsoid
-        'params': {
-            'a': {'type': 'log', 'range': (50, 1000)},  # equatorial
-            'c_over_a': {'type': 'linear', 'range': (1.3, 5.0)}
-        },
-        'polydispersity': True
-    },
-    'core_shell_sphere': {
-        'generator': 'mixtures',
-        'components': ['sphere_core', 'sphere_shell'],
-        'params': {
-            'r_core': {'type': 'log', 'range': (50, 800)},
-            't_shell': {'type': 'linear', 'range': (20, 200), 'constraint': 'r_core + t_shell <= 1000'}
-        },
-        'polydispersity': True
-    },
-    'hollow_sphere': {
-        'generator': 'bodies',
-        'body_type': 7,  # Hollow sphere
-        'params': {
-            'r_outer': {'type': 'log', 'range': (70, 1000)},
-            'r_inner': {'type': 'relative', 'range': (0.5, 0.9), 'base': 'r_outer'}
-        },
-        'polydispersity': True
-    },
-    'core_shell_oblate': {
-        'generator': 'mixtures',
-        'components': ['oblate_core', 'oblate_shell'],
-        'params': {
-            'a_core': {'type': 'log', 'range': (50, 800)},
-            'c_over_a': {'type': 'linear', 'range': (0.1, 0.77)},
-            't_shell': {'type': 'linear', 'range': (20, 200), 'constraint': 'a_core + t_shell <= 1000'}
-        },
-        'polydispersity': True
-    },
-    'core_shell_prolate': {
-        'generator': 'mixtures',
-        'components': ['prolate_core', 'prolate_shell'],
-        'params': {
-            'a_core': {'type': 'log', 'range': (50, 800)},
-            'c_over_a': {'type': 'linear', 'range': (1.3, 5.0)},
-            't_shell': {'type': 'linear', 'range': (20, 200), 'constraint': 'a_core + t_shell <= 1000'}
-        },
-        'polydispersity': True
-    },
-    'core_shell_cylinder': {
-        'generator': 'mixtures',
-        'components': ['cylinder_core', 'cylinder_shell'],
-        'params': {
-            'r_core': {'type': 'log', 'range': (50, 800)},
-            'length': {'type': 'relative', 'range': (1.0, 2.0), 'base': 'r_core'},
-            't_shell': {'type': 'linear', 'range': (20, 200), 'constraint': 'r_core + t_shell <= 1000'}
-        },
-        'polydispersity': True
-    }
-}
+def ensure_dirs(root: Path):
+    (root / "saxs").mkdir(parents=True, exist_ok=True)
+    (root / "logs").mkdir(parents=True, exist_ok=True)
+    (root / "tmp").mkdir(parents=True, exist_ok=True)
 
-# Bodies type mapping for interactive input
-BODIES_TYPE_MAP = {
-    'ellipsoid': 1,
-    'cylinder': 3,
-    'hollow_cylinder': 4,
-    'parallelepiped': 5,
-    'elliptical_cylinder': 6,
-    'hollow_sphere': 7,
-    'dumbbell': 8,
-    'liposome': 12,
-    'membrane_protein': 13
-}
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser()
+    p.add_argument("--n", type=int, default=10)
+    p.add_argument("--uid-offset", type=int, default=0)
+    p.add_argument("--out", type=str, default="dataset")
+    p.add_argument("--cfgs", type=str, nargs="+", required=True)
+    p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--append-meta", action="store_true")
+    p.add_argument("--mask", type=str, default=None, help="override beamstop mask path, wins over cfg")
+    p.add_argument("--timeout", type=int, default=600)
+    p.add_argument("--use-bodies", action="store_true", help="Use ATSAS bodies (DAM) via stdin for PDB generation")
+    p.add_argument("--per-class", type=int, default=0, help="If >0, generate exactly this many curves per shape class")
+    p.add_argument("--direct-crysol", action="store_true", help="Use CRYSOL .int files directly, bypassing IMSIM/IM2DAT (recommended for Windows)")
+    p.add_argument("--skip-tool-check", action="store_true", help="Skip checking for ATSAS tools (demo mode)")
+    return p.parse_args()
 
+def _estimate_spacing_from_volume(volume_A3: float, target_beads: int = 40000) -> float:
+    spacing = (volume_A3 / max(target_beads, 1)) ** (1.0 / 3.0)
+    return max(2.0, min(25.0, spacing))
 
-class ATSASWrapper:
-    """Wrapper for ATSAS command-line tools with interactive support"""
-    
-    def __init__(self, logger, max_parallel_atsas=2):
-        self.logger = logger
-        self.max_parallel_atsas = max_parallel_atsas  # ATSAS license limit
-        self._check_atsas()
-    
-    def _check_atsas(self):
-        """Check if ATSAS tools are available"""
-        required_tools = ['bodies', 'mixtures', 'imsim', 'im2dat', 'autorg']
-        for tool in required_tools:
-            try:
-                subprocess.run([tool], capture_output=True, check=False)
-            except FileNotFoundError:
-                # Try with .exe extension for Windows
-                try:
-                    subprocess.run([f"{tool}.exe"], capture_output=True, check=False)
-                except FileNotFoundError:
-                    raise RuntimeError(f"ATSAS tool '{tool}' not found in PATH")
-    
-    def bodies_predict(self, body_type: int, params: Dict, output_int: str, 
-                      q_range: Tuple[float, float] = (0.005, 0.5), 
-                      n_points: int = 200) -> None:
-        """
-        Generate theoretical scattering curve using bodies in predict mode
-        
-        Parameters:
-        -----------
-        body_type : int
-            Body type number (1=ellipsoid, 3=cylinder, etc.)
-        params : dict
-            Shape parameters
-        output_int : str
-            Output intensity file path
-        q_range : tuple
-            (q_min, q_max) in A^-1
-        n_points : int
-            Number of points in curve
-        """
-        # Build interactive input for bodies
-        input_lines = ['p']  # predict mode
-        input_lines.append(str(body_type))
-        
-        # Add parameters based on body type
-        if body_type == 1:  # Ellipsoid
-            input_lines.append(f"{params['a']:.6f}")
-            input_lines.append(f"{params['b']:.6f}")
-            input_lines.append(f"{params['c']:.6f}")
-        elif body_type == 3:  # Cylinder
-            input_lines.append(f"{params['radius']:.6f}")
-            input_lines.append(f"{params['length']:.6f}")
-        elif body_type == 7:  # Hollow sphere
-            input_lines.append(f"{params.get('r_outer', params.get('radius', 100)):.6f}")
-            input_lines.append(f"{params.get('r_inner', 0):.6f}")
-        
-        # Scale factor
-        input_lines.append('1.0')
-        
-        # q range and points
-        input_lines.append(f"{q_range[0]:.6f}")
-        input_lines.append(f"{q_range[1]:.6f}")
-        input_lines.append(str(n_points))
-        
-        # Output file
-        input_lines.append(output_int)
-        
-        # Join with newlines
-        input_str = '\n'.join(input_lines) + '\n'
-        
-        # Run bodies interactively
-        result = subprocess.run(
-            ['bodies'],
-            input=input_str,
-            text=True,
-            capture_output=True
-        )
-        
-        if result.returncode != 0:
-            raise RuntimeError(f"bodies failed: {result.stderr}")
-        
-        self.logger.debug(f"Generated intensity curve: {output_int}")
-    
-    def mixtures(self, components: List[Dict], output_int: str, 
-                polydispersity: Optional[Dict] = None) -> None:
-        """
-        Generate scattering curve for mixture of components
-        
-        Parameters:
-        -----------
-        components : list of dict
-            Each dict has 'file' (intensity file) and 'density' (relative)
-        output_int : str
-            Output intensity file
-        polydispersity : dict, optional
-            Polydispersity settings {'type': 'gaussian', 'width': 0.1}
-        """
-        # Build command - mixtures syntax varies by version
-        cmd = ['mixtures', '--output', output_int]
-        
-        for i, comp in enumerate(components):
-            cmd.extend([f'--comp{i+1}', comp['file']])
-            cmd.extend([f'--dens{i+1}', str(comp.get('density', 1.0))])
-        
-        if polydispersity:
-            cmd.extend(['--polydisperse', f"{polydispersity['type']},{polydispersity['width']}"])
-        
-        result = subprocess.run(cmd, capture_output=True, text=True)
-        
-        # If command-line mode fails, try interactive mode
-        if result.returncode != 0:
-            self._mixtures_interactive(components, output_int, polydispersity)
-    
-    def _mixtures_interactive(self, components: List[Dict], output_int: str,
-                            polydispersity: Optional[Dict] = None) -> None:
-        """Fallback interactive mode for mixtures"""
-        # This would need to be implemented based on specific ATSAS version
-        # For now, we'll generate a simple average
-        self.logger.warning("Using fallback mixing method")
-        
-        # Load and average components
-        intensities = []
-        for comp in components:
-            data = np.loadtxt(comp['file'])
-            intensities.append(data[:, 1] * comp.get('density', 1.0))
-        
-        # Simple average
-        q = data[:, 0]
-        I = np.mean(intensities, axis=0)
-        
-        # Save
-        np.savetxt(output_int, np.column_stack([q, I]), fmt='%.6e')
-    
-    def imsim(self, int_file: str, config_file: str, output_edf: str, seed: int) -> None:
-        """Simulate detector image"""
-        cmd = [
-            'imsim', int_file,
-            '--cfg', config_file,
-            '--seed', str(seed),
-            '-o', output_edf
-        ]
-        
-        result = subprocess.run(cmd, capture_output=True, text=True)
-        if result.returncode != 0:
-            raise RuntimeError(f"imsim failed: {result.stderr}")
-    
-    def im2dat(self, edf_file: str, mask_file: str, output_dat: str) -> None:
-        """Convert 2D image to 1D curve with errors"""
-        cmd = [
-            'im2dat', edf_file,
-            '--mask', mask_file,
-            '-o', output_dat
-        ]
-        
-        result = subprocess.run(cmd, capture_output=True, text=True)
-        if result.returncode != 0:
-            raise RuntimeError(f"im2dat failed: {result.stderr}")
+def _frange_centered(min_val: float, max_val: float, step: float) -> Iterable[float]:
+    if step <= 0:
+        yield 0.0
+        return
+    n = int(math.floor((max_val - min_val) / step))
+    for i in range(n + 1):
+        yield min_val + i * step
 
-
-class ParameterSampler:
-    """Sample parameters for different shapes"""
-    
-    def __init__(self, rng: np.random.Generator):
-        self.rng = rng
-    
-    def sample(self, shape_name: str, spec: Dict) -> Dict:
-        """Sample parameters for a given shape"""
-        params = {'shape_class': shape_name}
-        
-        for param_name, param_spec in spec['params'].items():
-            if param_spec['type'] == 'log':
-                value = self.rng.uniform(np.log(param_spec['range'][0]), 
-                                       np.log(param_spec['range'][1]))
-                params[param_name] = np.exp(value)
-            elif param_spec['type'] == 'linear':
-                params[param_name] = self.rng.uniform(*param_spec['range'])
-            elif param_spec['type'] == 'relative':
-                base_value = params[param_spec['base']]
-                factor = self.rng.uniform(*param_spec['range'])
-                params[param_name] = base_value * factor
-        
-        # Apply constraints
-        for param_name, param_spec in spec['params'].items():
-            if 'constraint' in param_spec:
-                # Simple constraint evaluation (in production, use safer method)
-                constraint = param_spec['constraint']
-                for p, v in params.items():
-                    constraint = constraint.replace(p, str(v))
-                if not eval(constraint):
-                    # Resample if constraint violated
-                    return self.sample(shape_name, spec)
-        
-        # Add polydispersity
-        if spec.get('polydispersity', False):
-            params['polydispersity'] = self.rng.uniform(0, 0.3)
-        else:
-            params['polydispersity'] = 0.0
-        
-        # Calculate derived parameters
-        if 'c_over_a' in params:
-            params['c'] = params['a'] * params['c_over_a']
-            params['b'] = params['a']  # for ellipsoids, b = a
-        
-        return params
-
-
-def generate_single_curve(args: Tuple[int, str, Dict, Dict, Path, np.random.Generator]) -> Dict:
-    """Generate a single SAXS curve - worker function for parallel processing"""
-    uid, shape_name, params, config, output_dir, seed = args
-    
-    # Setup logging for this worker
-    log_file = output_dir / 'logs' / f'{uid:06d}.log'
-    log_file.parent.mkdir(exist_ok=True)
-    
-    file_handler = logging.FileHandler(log_file)
-    file_handler.setLevel(logging.DEBUG)
-    logger = logging.getLogger(f'worker_{uid}')
-    logger.addHandler(file_handler)
-    logger.setLevel(logging.DEBUG)
-    
-    # Create RNG with unique seed
-    rng = np.random.default_rng(seed)
-    
-    try:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            tmpdir = Path(tmpdir)
-            
-            # Initialize wrappers
-            atsas = ATSASWrapper(logger)
-            sampler = ParameterSampler(rng)
-            
-            # Sample parameters
-            shape_spec = SHAPE_SPECS[shape_name]
-            sampled_params = sampler.sample(shape_name, shape_spec)
-            
-            # Generate theoretical scattering curve
-            int_file = tmpdir / 'theoretical.int'
-            
-            if shape_spec['generator'] == 'bodies':
-                # Direct generation of I(q) using bodies predict mode
-                atsas.bodies_predict(
-                    body_type=shape_spec['body_type'],
-                    params=sampled_params,
-                    output_int=str(int_file),
-                    q_range=(config['qmin'], config['qmax']),
-                    n_points=config['bins']
-                )
-                
-                # Apply polydispersity if needed
-                if sampled_params['polydispersity'] > 0:
-                    # Use mixtures to apply polydispersity
-                    poly_file = tmpdir / 'polydisperse.int'
-                    atsas.mixtures(
-                        components=[{'file': str(int_file), 'density': 1.0}],
-                        output_int=str(poly_file),
-                        polydispersity={
-                            'type': 'gaussian',
-                            'width': sampled_params['polydispersity']
-                        }
-                    )
-                    int_file = poly_file
-                    
-            else:  # mixtures for core-shell
-                # Generate components separately
-                components = []
-                
-                # This is simplified - real implementation would generate
-                # each component with proper parameters
-                for i, comp_name in enumerate(shape_spec['components']):
-                    comp_file = tmpdir / f'component_{i}.int'
-                    # Generate component curve...
-                    # For now, use a placeholder
-                    components.append({
-                        'file': str(comp_file),
-                        'density': 1.0 if i == 0 else -0.5  # Core vs shell
-                    })
-                
-                # Combine with mixtures
-                atsas.mixtures(
-                    components=components,
-                    output_int=str(int_file),
-                    polydispersity={
-                        'type': 'gaussian',
-                        'width': sampled_params['polydispersity']
-                    } if sampled_params['polydispersity'] > 0 else None
-                )
-            
-            # Simulate detector image
-            edf_file = tmpdir / 'detector.edf'
-            atsas.imsim(
-                int_file=str(int_file),
-                config_file=str(config['config_file']),
-                output_edf=str(edf_file),
-                seed=int(rng.integers(2**32))
+def _write_pdb(points: Iterable[Tuple[float, float, float]], out_path: Path) -> None:
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(out_path, "w", encoding="utf-8") as f:
+        serial = 1
+        for (x, y, z) in points:
+            # PDB ATOM record: columns match typical CRYSOL expectations
+            f.write(
+                f"ATOM  {serial:5d}  C   DAM A   1    "
+                f"{x:8.3f}{y:8.3f}{z:8.3f}  1.00  0.00           C\n"
             )
-            
-            # Convert to 1D curve with errors
-            dat_file = output_dir / 'saxs' / f'{uid:06d}.dat'
-            dat_file.parent.mkdir(exist_ok=True)
-            
-            atsas.im2dat(
-                edf_file=str(edf_file),
-                mask_file=str(config['mask_file']),
-                output_dat=str(dat_file)
-            )
-            
-            # Prepare metadata
-            metadata = {
-                'uid': uid,
-                'shape_class': shape_name,
-                'generator': shape_spec['generator'],
-                'true_params': json.dumps(sampled_params),
-                'instrument_cfg': config['name'],
-                'seed': seed,
-                'timestamp': datetime.now().isoformat()
-            }
-            
-            logger.info(f"Successfully generated curve {uid}")
-            return metadata
-            
-    except Exception as e:
-        logger.error(f"Failed to generate curve {uid}: {str(e)}")
-        return {'uid': uid, 'error': str(e)}
+            serial += 1
+        f.write("END\n")
 
+def _generate_pdb_sphere(radius_A: float, out_path: Path) -> None:
+    volume = (4.0 / 3.0) * math.pi * radius_A ** 3
+    step = _estimate_spacing_from_volume(volume)
+    r2 = radius_A * radius_A
+    pts = []
+    for x in _frange_centered(-radius_A, radius_A, step):
+        x2 = x * x
+        for y in _frange_centered(-radius_A, radius_A, step):
+            y2 = y * y
+            xy2 = x2 + y2
+            if xy2 > r2:
+                continue
+            for z in _frange_centered(-radius_A, radius_A, step):
+                if xy2 + z * z <= r2:
+                    pts.append((x, y, z))
+    _write_pdb(pts, out_path)
+
+def _generate_pdb_cylinder(radius_A: float, length_A: float, out_path: Path) -> None:
+    volume = math.pi * radius_A ** 2 * length_A
+    step = _estimate_spacing_from_volume(volume)
+    r2 = radius_A * radius_A
+    half_L = 0.5 * length_A
+    pts = []
+    for x in _frange_centered(-radius_A, radius_A, step):
+        x2 = x * x
+        for y in _frange_centered(-radius_A, radius_A, step):
+            if x2 + y * y > r2:
+                continue
+            for z in _frange_centered(-half_L, half_L, step):
+                pts.append((x, y, z))
+    _write_pdb(pts, out_path)
+
+def _generate_pdb_ellipsoid(a_A: float, b_A: float, c_A: float, out_path: Path) -> None:
+    volume = (4.0 / 3.0) * math.pi * a_A * b_A * c_A
+    step = _estimate_spacing_from_volume(volume)
+    pts = []
+    for x in _frange_centered(-a_A, a_A, step):
+        xn = (x / a_A) ** 2
+        if xn > 1.0:
+            continue
+        for y in _frange_centered(-b_A, b_A, step):
+            yn = (y / b_A) ** 2
+            if xn + yn > 1.0:
+                continue
+            for z in _frange_centered(-c_A, c_A, step):
+                zn = (z / c_A) ** 2
+                if xn + yn + zn <= 1.0:
+                    pts.append((x, y, z))
+    _write_pdb(pts, out_path)
+
+def _generate_pdb_parallelepiped(a_A: float, b_A: float, c_A: float, out_path: Path) -> None:
+    volume = a_A * b_A * c_A
+    step = _estimate_spacing_from_volume(volume)
+    half_a, half_b, half_c = 0.5 * a_A, 0.5 * b_A, 0.5 * c_A
+    pts = []
+    for x in _frange_centered(-half_a, half_a, step):
+        for y in _frange_centered(-half_b, half_b, step):
+            for z in _frange_centered(-half_c, half_c, step):
+                pts.append((x, y, z))
+    _write_pdb(pts, out_path)
+
+def generate_pdb_model(shape_class: str, params: Dict[str, float], out_path: Path) -> None:
+    """Pure-Python DAM-like PDB generator (fallback when 'bodies' is unavailable).
+    Shapes: sphere, cylinder, oblate/prolate (as ellipsoid), parallelepiped, etc."""
+    if shape_class == "sphere":
+        _generate_pdb_sphere(params["radius"], out_path)
+        return
+    if shape_class == "cylinder":
+        _generate_pdb_cylinder(params["radius"], params["length"], out_path)
+        return
+    if shape_class in ("oblate", "prolate", "ellipsoid_triaxial", "ellipsoid_of_rotation"):
+        _generate_pdb_ellipsoid(params["a"], params.get("b", params["a"]), params["c"], out_path)
+        return
+    if shape_class == "parallelepiped":
+        _generate_pdb_parallelepiped(params["a"], params["b"], params["c"], out_path)
+        return
+    if shape_class in ("hollow_sphere", "hollow_cylinder", "elliptical_cylinder"):
+        # For complex shapes, fallback to simple approximations
+        if shape_class == "hollow_sphere":
+            _generate_pdb_sphere(params["outer_radius"], out_path)
+        elif shape_class == "hollow_cylinder":
+            _generate_pdb_cylinder(params["outer_radius"], params["length"], out_path)
+        elif shape_class == "elliptical_cylinder":
+            _generate_pdb_cylinder(max(params["a"], params.get("b", params["a"])), params["length"], out_path)
+        return
+    if shape_class in ("dumbbell", "liposome", "membrane_protein"):
+        # For very complex shapes, use simple sphere approximations
+        if shape_class == "dumbbell":
+            r_approx = (params["r1"] + params["r2"]) / 2
+            _generate_pdb_sphere(r_approx, out_path)
+        elif shape_class == "liposome":
+            _generate_pdb_sphere(params["outer_radius"], out_path)
+        elif shape_class == "membrane_protein":
+            _generate_pdb_sphere(params["rmemb"], out_path)
+        return
+    if shape_class.startswith("core_shell_"):
+        # Core-shell approximations using outer dimensions
+        if shape_class == "core_shell_sphere":
+            total_radius = params["core_radius"] + params["shell_thickness"]
+            _generate_pdb_sphere(total_radius, out_path)
+        elif shape_class in ("core_shell_oblate", "core_shell_prolate"):
+            total_radius = params["equatorial_core_radius"] + params["shell_thickness"]
+            axial_ratio = params["axial_ratio"]
+            polar_radius = axial_ratio * total_radius
+            _generate_pdb_ellipsoid(total_radius, total_radius, polar_radius, out_path)
+        elif shape_class == "core_shell_cylinder":
+            total_radius = params["core_radius"] + params["shell_thickness"]
+            _generate_pdb_cylinder(total_radius, params["length"], out_path)
+        return
+    raise NotImplementedError(f"PDB generator not implemented for shape {shape_class}")
 
 def main():
-    parser = argparse.ArgumentParser(description='Generate SAXS dataset using ATSAS')
-    parser.add_argument('--n', type=int, default=37656, help='Total number of curves to generate')
-    parser.add_argument('--jobs', type=int, default=20, help='Number of parallel jobs')
-    parser.add_argument('--out', type=str, default='dataset/', help='Output directory')
-    parser.add_argument('--seed', type=int, default=42, help='Random seed')
-    parser.add_argument('--retry', type=str, help='Retry failed UIDs from file')
-    parser.add_argument('--atsas-parallel', type=int, default=2, 
-                       help='Max parallel ATSAS processes (license limit)')
-    
-    args = parser.parse_args()
-    
-    # Setup paths
-    output_dir = Path(args.out)
-    output_dir.mkdir(exist_ok=True)
-    (output_dir / 'saxs').mkdir(exist_ok=True)
-    (output_dir / 'logs').mkdir(exist_ok=True)
-    
-    # Setup main logger
-    logging.basicConfig(
-        level=logging.INFO,
-        format='%(asctime)s - %(levelname)s - %(message)s',
-        handlers=[
-            logging.FileHandler(output_dir / 'generate.log'),
-            logging.StreamHandler()
-        ]
-    )
-    logger = logging.getLogger('main')
-    
-    # Load instrument configurations
-    configs = {
-        'Xeuss1800HR': {
-            'name': 'Xeuss1800HR',
-            'config_file': Path('configs/xeuss.yml'),
-            'mask_file': Path('masks/eiger1m.msk'),
-            'qmin': 0.0031,
-            'qmax': 0.149,
-            'bins': 890
-        },
-        'NanoInXiderHR': {
-            'name': 'NanoInXiderHR', 
-            'config_file': Path('configs/nanoinx.yml'),
-            'mask_file': Path('masks/eiger1m.msk'),
-            'qmin': 0.0019,
-            'qmax': 0.445,
-            'bins': 890
-        }
-    }
-    
-    # Initialize RNG
-    rng = np.random.default_rng(args.seed)
-    
-    # Calculate samples per shape (balanced dataset)
-    n_shapes = len(SHAPE_SPECS)
-    samples_per_shape = args.n // n_shapes
-    remainder = args.n % n_shapes
-    
-    logger.info(f"Generating {args.n} curves ({samples_per_shape} per shape, {remainder} extra)")
-    logger.info(f"ATSAS parallel limit: {args.atsas_parallel}")
-    
-    # Prepare work items
-    work_items = []
-    uid = 0
-    
-    for i, shape_name in enumerate(SHAPE_SPECS):
-        n_samples = samples_per_shape + (1 if i < remainder else 0)
-        for _ in range(n_samples):
-            # Randomly select instrument configuration
-            config_name = rng.choice(list(configs.keys()))
-            config = configs[config_name]
-            
-            # Generate unique seed for this sample
-            sample_seed = rng.integers(2**32)
-            
-            work_items.append((uid, shape_name, SHAPE_SPECS[shape_name], 
-                             config, output_dir, sample_seed))
-            uid += 1
-    
-    # Handle retries if specified
-    if args.retry:
-        with open(args.retry, 'r') as f:
-            failed_uids = [int(line.strip()) for line in f]
-        work_items = [item for item in work_items if item[0] in failed_uids]
-        logger.info(f"Retrying {len(work_items)} failed curves")
-    
-    # Generate curves with limited parallelism for ATSAS
-    metadata_list = []
-    failed_list = []
-    
-    # Use limited parallelism to respect ATSAS license
-    effective_jobs = min(args.jobs, args.atsas_parallel)
-    logger.info(f"Using {effective_jobs} parallel workers (limited by ATSAS)")
-    
-    with ProcessPoolExecutor(max_workers=effective_jobs) as executor:
-        futures = []
+    args = parse_args()
+    out_root = Path(args.out).resolve()
+    ensure_dirs(out_root)
+    # Check tools early
+    if not args.skip_tool_check:
+        for exe in ["crysol", "imsim", "im2dat"]:
+            which_or_die(exe)
+        if args.use_bodies:
+            which_or_die("bodies")
+
+    cfgs = [Instrument.from_yaml(Path(p)) for p in args.cfgs]
+    meta_rows: List[Dict[str, Any]] = []
+    meta_path = out_root / "meta.csv"
+    need_header = not (args.append_meta and meta_path.exists())
+
+    def build_bodies_dam_stdin(shape_class: str, params: Dict[str, float], pdb_out: Path) -> str:
+        lines: List[str] = []
+        # Enter DAM mode
+        lines.append("d")
         
-        # Submit jobs in batches to avoid overwhelming ATSAS
-        for i in range(0, len(work_items), effective_jobs):
-            batch = work_items[i:i+effective_jobs]
-            batch_futures = [executor.submit(generate_single_curve, item) 
-                           for item in batch]
-            futures.extend(batch_futures)
-            
-            # Small delay between batches
-            if i + effective_jobs < len(work_items):
-                time.sleep(0.5)
+        # Map shape classes to ATSAS 4.x body type numbers
+        if shape_class == "sphere":
+            # Use hollow-sphere (7) with inner_radius=0 for solid sphere
+            lines.append("7")  # hollow-sphere
+            if "radius" in params:
+                lines.append(f"{params['radius']:.6f}")  # outer_radius (ro)
+                lines.append("0.0")  # inner_radius (ri) - 0 = solid
+            else:
+                lines.append(f"{params.get('outer_radius', 50.0):.6f}")
+                lines.append(f"{params.get('inner_radius', 0.0):.6f}")
+            lines.append("1.0")  # scale parameter
+        elif shape_class == "hollow_sphere":
+            lines.append("7")  # hollow-sphere
+            lines.append(f"{params['outer_radius']:.6f}")  # ro
+            lines.append(f"{params['inner_radius']:.6f}")  # ri
+            lines.append("1.0")  # scale
+        elif shape_class == "cylinder":
+            lines.append("3")  # cylinder
+            lines.append(f"{params['radius']:.6f}")  # r
+            lines.append(f"{params['length']:.6f}")  # h
+            lines.append("1.0")  # scale
+        elif shape_class == "hollow_cylinder":
+            lines.append("5")  # hollow-cylinder
+            lines.append(f"{params['outer_radius']:.6f}")  # ro
+            lines.append(f"{params['inner_radius']:.6f}")  # ri
+            lines.append(f"{params['length']:.6f}")  # h
+            lines.append("1.0")  # scale
+        elif shape_class == "elliptical_cylinder":
+            lines.append("4")  # elliptic-cylinder
+            lines.append(f"{params['a']:.6f}")  # a
+            lines.append(f"{params['b']:.6f}")  # b
+            lines.append(f"{params['length']:.6f}")  # h
+            lines.append("1.0")  # scale
+        elif shape_class in ("oblate", "prolate"):
+            lines.append("1")  # ellipsoid
+            lines.append(f"{params['a']:.6f}")  # a
+            lines.append(f"{params['b']:.6f}")  # b
+            lines.append(f"{params['c']:.6f}")  # c
+            lines.append("1.0")  # scale
+        elif shape_class == "parallelepiped":
+            lines.append("6")  # parallelepiped
+            lines.append(f"{params['a']:.6f}")  # a
+            lines.append(f"{params['b']:.6f}")  # b
+            lines.append(f"{params['c']:.6f}")  # c
+            lines.append("1.0")  # scale
+            # ATSAS bodies asks for parameters again for parallelepiped
+            lines.append(f"{params['a']:.6f}")  # a (repeated)
+            lines.append(f"{params['b']:.6f}")  # b (repeated) 
+            lines.append(f"{params['c']:.6f}")  # c (repeated)
+        elif shape_class == "ellipsoid_triaxial":
+            lines.append("1")  # ellipsoid (triaxial)
+            lines.append(f"{params['a']:.6f}")  # a
+            lines.append(f"{params['b']:.6f}")  # b
+            lines.append(f"{params['c']:.6f}")  # c
+            lines.append("1.0")  # scale
+        elif shape_class == "ellipsoid_of_rotation":
+            lines.append("2")  # ellipsoid of rotation
+            a = params.get("a", params.get("radius", 50.0))
+            ratio = params.get("ratio", params.get("c", a) / a if a else 1.0)
+            lines.append(f"{a:.6f}")  # equatorial radius
+            lines.append(f"{ratio:.6f}")  # aspect ratio (c/a)
+            lines.append("1.0")  # scale
+        elif shape_class == "dumbbell":
+            lines.append("8")  # dumbbell
+            lines.append(f"{params['r1']:.6f}")  # radius 1
+            lines.append(f"{params['r2']:.6f}")  # radius 2
+            lines.append(f"{params['center_distance']:.6f}")  # center distance
+            lines.append("1.0")  # scale
+        elif shape_class == "liposome":
+            lines.append("9")  # liposome
+            lines.append(f"{params['outer_radius']:.6f}")  # outer radius
+            lines.append(f"{params['bilayer_thickness']:.6f}")  # bilayer thickness
+            lines.append(f"{params['inner_radius']:.6f}")  # inner radius
+            lines.append("1.0")  # scale
+        elif shape_class == "membrane_protein":
+            lines.append("10")  # membrane protein
+            lines.append(f"{params['rmemb']:.6f}")  # membrane radius
+            lines.append(f"{params['rtail']:.6f}")  # tail radius
+            lines.append(f"{params['rhead']:.6f}")  # head radius
+            lines.append(f"{params['delta']:.6f}")  # delta
+            lines.append(f"{params['zcorona']:.6f}")  # z corona
+            lines.append("1.0")  # scale
+        # Core-shell shapes - these will be approximated using hollow variants or mixtures at curve level
+        elif shape_class == "core_shell_sphere":
+            # Approximate as hollow sphere
+            total_radius = params["core_radius"] + params["shell_thickness"]
+            lines.append("7")  # hollow-sphere
+            lines.append(f"{total_radius:.6f}")  # outer_radius
+            lines.append(f"{params['core_radius']:.6f}")  # inner_radius (core)
+            lines.append("1.0")  # scale
+        elif shape_class in ("core_shell_oblate", "core_shell_prolate"):
+            # Approximate as solid ellipsoid with total dimensions
+            total_radius = params["equatorial_core_radius"] + params["shell_thickness"]
+            axial_ratio = params["axial_ratio"]
+            polar_radius = axial_ratio * total_radius
+            lines.append("1")  # ellipsoid
+            lines.append(f"{total_radius:.6f}")  # a (equatorial)
+            lines.append(f"{total_radius:.6f}")  # b (equatorial)
+            lines.append(f"{polar_radius:.6f}")  # c (polar)
+            lines.append("1.0")  # scale
+        elif shape_class == "core_shell_cylinder":
+            # Approximate as hollow cylinder
+            total_radius = params["core_radius"] + params["shell_thickness"]
+            lines.append("5")  # hollow-cylinder
+            lines.append(f"{total_radius:.6f}")  # outer_radius
+            lines.append(f"{params['core_radius']:.6f}")  # inner_radius
+            lines.append(f"{params['length']:.6f}")  # length
+            lines.append("1.0")  # scale
+        else:
+            raise NotImplementedError(f"BODIES shape {shape_class} not supported")
         
-        with tqdm(total=len(work_items), desc="Generating curves") as pbar:
-            for future in as_completed(futures):
-                result = future.result()
-                if 'error' in result:
-                    failed_list.append(result['uid'])
+        # Symmetry selection (default P1)
+        lines.append("1")  # P1 symmetry
+        
+        # Number of dummy atoms (default is fine)
+        lines.append("2000")  # number of dummy atoms
+        
+        # Output file path
+        lines.append(str(pdb_out))
+        lines.append("")  # Empty line to finish
+        return "\n".join(lines)
+
+    def generate_one_uid(uid: int, sample_shape: str | None = None) -> None:
+        rng = random.Random(args.seed + uid)
+        sample = draw_shape(rng, shape=sample_shape)
+        cfg = rng.choice(cfgs)
+        log_file = out_root / "logs" / f"{uid:06d}.log"
+        try:
+            with tempfile.TemporaryDirectory(dir=out_root / "tmp") as td:
+                td = Path(td)
+                pdb_path = td / "model.pdb"
+                pdb_generated = False
+                generator_used = "pythonDAM"
+                
+                if args.use_bodies and shutil.which("bodies"):
+                    try:
+                        from atsas_cli import run_bodies_dam
+                        stdin_text = build_bodies_dam_stdin(sample.shape_class, sample.params, pdb_path)
+                        run_bodies_dam(stdin_text, log_file, timeout=args.timeout)
+                        pdb_generated = True
+                        generator_used = "bodies"
+                    except Exception as e:
+                        # Bodies failed, fallback to Python DAM
+                        with open(log_file, "a", encoding="utf-8") as lf:
+                            lf.write(f"\n[FALLBACK] Bodies failed: {e}\n")
+                            lf.write(f"[FALLBACK] Using Python DAM generator\n")
+                
+                if not pdb_generated:
+                    generate_pdb_model(sample.shape_class, sample.params, pdb_path)
+                    generator_used = "pythonDAM"
+
+                abs_path = run_crysol(pdb_path, out_base=td / "noiseless", qmax=0.45, bins=890,
+                                      absolute=True, lsq="1e-5", log_file=log_file, timeout=args.timeout)
+
+                out_dat = out_root / "saxs" / f"{uid:06d}__{cfg.name}.dat"
+                
+                if args.direct_crysol:
+                    # Use .int file directly, bypass IMSIM/IM2DAT
+                    int_path = td / "noiseless.int"
+                    if int_path.exists():
+                        convert_int_to_dat(int_path, out_dat, f"CRYSOL {sample.shape_class}")
+                    else:
+                        raise RuntimeError(f"CRYSOL .int file not found: {int_path}")
                 else:
-                    metadata_list.append(result)
-                pbar.update(1)
-    
-    # Save metadata
-    if metadata_list:
-        df = pd.DataFrame(metadata_list)
-        df.to_csv(output_dir / 'meta.csv', index=False)
-        logger.info(f"Saved metadata for {len(metadata_list)} curves")
-    
-    # Save failed UIDs
-    if failed_list:
-        with open(output_dir / 'failed.txt', 'w') as f:
-            for uid in failed_list:
-                f.write(f"{uid}\n")
-        logger.warning(f"{len(failed_list)} curves failed to generate")
-    
-    logger.info("Dataset generation complete")
+                    # Traditional IMSIM/IM2DAT pipeline
+                    frame_path = td / "frame.tiff"
+                    imsim_args = build_imsim_args(
+                        abs_file=abs_path,
+                        detector=cfg.detector,
+                        detector_distance_m=cfg.detector_distance_m,
+                        wavelength_A=cfg.wavelength_A,
+                        flux_ph_s=cfg.flux_ph_s,
+                        exposure_s=cfg.exposure_s,
+                        out_frame=frame_path,
+                        seed=rng.randrange(0, 2**31-1),
+                        extra=None,
+                        output_format="TIFF"
+                    )
+                    run(imsim_args, log_file, timeout=args.timeout)
 
+                    beam_mask = Path(args.mask) if args.mask else cfg.beamstop_mask
+                    if beam_mask and not Path(beam_mask).exists():
+                        beam_mask = None
+                    axis_data = cfg.axis_out if (getattr(cfg, "axis_out", None) and Path(cfg.axis_out).exists()) else None
+                    run_im2dat(frame_path, out_dat, beam_mask, axis_data, log_file, timeout=args.timeout)
 
-if __name__ == '__main__':
+            meta_rows.append({
+                "uid": uid,
+                "shape_class": sample.shape_class,
+                "generator": (("bodies+crysol" if args.use_bodies else "pythonDAM+crysol") + 
+                            ("+direct" if args.direct_crysol else "+imsim+im2dat")),
+                "true_params": json.dumps({**sample.params, "poly_sigma": sample.poly_sigma}, ensure_ascii=False),
+                "instrument_cfg": cfg.name,
+                "seed": args.seed + uid
+            })
+        except Exception as e:
+            with open(out_root / "failed.txt", "a", encoding="utf-8") as f:
+                f.write(f"{uid}\t{e}\n")
+            print(f"[WARN] uid={uid} failed: {e}", file=sys.stderr)
+
+    if args.per_class and args.per_class > 0:
+        classes = available_shapes()
+        uid = args.uid_offset
+        for cls in classes:
+            for _ in range(args.per_class):
+                generate_one_uid(uid, sample_shape=cls)
+                uid += 1
+    else:
+        for i in range(args.n):
+            uid = args.uid_offset + i
+            generate_one_uid(uid)
+
+    if meta_rows:
+        df = pd.DataFrame(meta_rows, columns=["uid","shape_class","generator","true_params","instrument_cfg","seed"])
+        mode = "a" if (args.append_meta and meta_path.exists()) else "w"
+        header = not (args.append_meta and meta_path.exists()) and need_header
+        df.to_csv(meta_path, index=False, mode=mode, header=header)
+
+if __name__ == "__main__":
     main()

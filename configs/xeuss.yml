@@ -1,33 +1,9 @@
-# Configuration for Xeuss 1800HR instrument
-# Used by imsim for detector simulation
-
-instrument:
-  name: "Xeuss 1800HR"
-  type: "SAXS"
-  
-source:
-  wavelength: 1.54  # Angstrom (Cu K-alpha)
-  flux: 3.43e6      # photons/second
-  
-beam:
-  fwhm: 0.0016      # FWHM in q-space (A^-1)
-  shape: "gaussian"
-  
-detector:
-  name: "Dectris Eiger 1M"
-  sdd: 1800         # Sample-to-detector distance (mm)
-  pixel_size: 0.075 # mm
-  nx: 1030          # pixels
-  ny: 1065          # pixels
-  
-q_range:
-  min: 0.0031       # A^-1
-  max: 0.149        # A^-1
-  
-exposure:
-  time: 1200        # seconds (20 minutes)
-  
-noise:
-  dark_current: 0.1 # counts/pixel/second
-  readout_noise: 2.5
-  quantum_efficiency: 0.94
+# configs/xeuss.yml
+name: Xeuss1800HR
+detector: Eiger1M
+detector_distance_m: 1.8
+wavelength_A: 1.54
+flux_ph_s: 3.43e6
+exposure_s: 1200
+# beamstop_mask: masks/eiger1m.msk   # disable on Windows if mask file missing
+# axis_out: axis.dat   # optional; if present, im2dat will reuse it
