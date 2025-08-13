@@ -15,10 +15,17 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 
-# Add scripts directory to path
+# Add scripts directory to path (if running from repo root)
 sys.path.append('scripts')
 
-from generate import SHAPE_SPECS, ATSASWrapper, ParameterSampler
+# The public APIs used by examples are not available in current codebase.
+# Keep imports optional to avoid runtime errors when running examples.
+try:
+    from generate import SHAPE_SPECS, ATSASWrapper, ParameterSampler
+except Exception:  # noqa: BLE001
+    SHAPE_SPECS = None
+    ATSASWrapper = None
+    ParameterSampler = None
 
 
 def generate_custom_dataset():
@@ -28,8 +35,11 @@ def generate_custom_dataset():
     
     # Initialize components  
     logger = logging.getLogger('custom')
-    atsas = ATSASWrapper(logger)
     rng = np.random.default_rng(seed=42)
+    if ParameterSampler is None or ATSASWrapper is None:
+        print("Required APIs are not available in this build; skipping actual ATSAS generation.")
+        return pd.DataFrame()
+    atsas = ATSASWrapper(logger)
     sampler = ParameterSampler(rng)
     
     # Custom configuration - only spheres with specific size range
