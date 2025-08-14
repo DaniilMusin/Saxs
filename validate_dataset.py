@@ -27,7 +27,7 @@ def check_file_counts(dataset_dir):
     # Check expected count (17 shapes × 5000 = 85,000)
     expected = 17 * 5000
     if len(dat_files) == expected:
-        print(f"✓ File count matches expected: {expected}")
+        print(f"OK: File count matches expected: {expected}")
         return True
     else:
         print(f"WARNING: File count mismatch: expected {expected}, found {len(dat_files)}")
@@ -39,7 +39,7 @@ def analyze_filenames(dataset_dir):
     saxs_dir = dataset_dir / "saxs"
     dat_files = list(saxs_dir.glob("*.dat"))
     
-    shape_pattern = r'\d+__([^_]+)__.*\.dat'
+    shape_pattern = r'\d+__([^_]+(?:_[^_]+)*)__.*\.dat'
     shape_counts = Counter()
     
     for file in dat_files:
@@ -48,9 +48,9 @@ def analyze_filenames(dataset_dir):
             shape = match.group(1)
             shape_counts[shape] += 1
         else:
-            print(f"⚠️  Unrecognized filename format: {file.name}")
+            print(f"WARNING: Unrecognized filename format: {file.name}")
     
-    print(f"📊 Shape distribution:")
+    print(f"Shape distribution:")
     total_shapes = len(shape_counts)
     for shape, count in sorted(shape_counts.items()):
         print(f"  {shape}: {count} samples")
@@ -60,13 +60,13 @@ def analyze_filenames(dataset_dir):
     all_correct = True
     for shape, count in shape_counts.items():
         if count != expected_per_shape:
-            print(f"⚠️  {shape}: expected {expected_per_shape}, got {count}")
+            print(f"WARNING: {shape}: expected {expected_per_shape}, got {count}")
             all_correct = False
     
     if all_correct and total_shapes == 17:
-        print(f"✅ All {total_shapes} shapes have exactly {expected_per_shape} samples each")
+        print(f"OK: All {total_shapes} shapes have exactly {expected_per_shape} samples each")
     else:
-        print(f"❌ Shape distribution issues found")
+        print(f"ERROR: Shape distribution issues found")
     
     return shape_counts
 
@@ -76,25 +76,25 @@ def validate_metadata(dataset_dir):
     meta_file = dataset_dir / "meta.csv"
     
     if not meta_file.exists():
-        print("❌ meta.csv not found!")
+        print("ERROR: meta.csv not found!")
         return None
     
     df = pd.read_csv(meta_file)
-    print(f"📄 Metadata rows: {len(df)}")
-    print(f"📋 Metadata columns: {list(df.columns)}")
+    print(f"Metadata rows: {len(df)}")
+    print(f"Metadata columns: {list(df.columns)}")
     
     # Check required columns
     required_cols = ['uid', 'shape_class', 'true_params', 'generator']
     missing_cols = [col for col in required_cols if col not in df.columns]
     if missing_cols:
-        print(f"❌ Missing required columns: {missing_cols}")
+        print(f"ERROR: Missing required columns: {missing_cols}")
         return None
     else:
-        print("✅ All required columns present")
+        print("OK: All required columns present")
     
     # Check shape distribution in metadata
     shape_counts = df['shape_class'].value_counts()
-    print(f"📊 Metadata shape distribution:")
+    print(f"Metadata shape distribution:")
     for shape, count in sorted(shape_counts.items()):
         print(f"  {shape}: {count}")
     
@@ -107,7 +107,7 @@ def validate_saxs_files(dataset_dir, sample_size=10):
     dat_files = list(saxs_dir.glob("*.dat"))
     
     if len(dat_files) == 0:
-        print("❌ No .dat files found!")
+        print("ERROR: No .dat files found!")
         return
     
     # Sample random files
@@ -148,9 +148,9 @@ def validate_saxs_files(dataset_dir, sample_size=10):
         except Exception as e:
             issues.append(f"{file.name}: Error reading file - {e}")
     
-    print(f"✅ Valid files: {valid_files}/{len(sample_files)}")
+    print(f"OK: Valid files: {valid_files}/{len(sample_files)}")
     if issues:
-        print("⚠️  Issues found:")
+        print("WARNING: Issues found:")
         for issue in issues[:5]:  # Show first 5 issues
             print(f"  - {issue}")
         if len(issues) > 5:
@@ -162,7 +162,7 @@ def validate_parameters(dataset_dir):
     meta_file = dataset_dir / "meta.csv"
     
     if not meta_file.exists():
-        print("❌ meta.csv not found!")
+        print("ERROR: meta.csv not found!")
         return
     
     df = pd.read_csv(meta_file)
@@ -203,9 +203,9 @@ def validate_parameters(dataset_dir):
             issues.append(f"UID {row['uid']}: Invalid JSON in true_params")
     
     if not issues:
-        print("✅ All sampled parameters within expected ranges")
+        print("OK: All sampled parameters within expected ranges")
     else:
-        print(f"⚠️  Parameter issues found ({len(issues)} total):")
+        print(f"WARNING: Parameter issues found ({len(issues)} total):")
         for issue in issues[:5]:
             print(f"  - {issue}")
         if len(issues) > 5:
@@ -217,7 +217,7 @@ def create_summary_plot(dataset_dir):
     meta_file = dataset_dir / "meta.csv"
     
     if not meta_file.exists():
-        print("❌ meta.csv not found!")
+        print("ERROR: meta.csv not found!")
         return
     
     df = pd.read_csv(meta_file)
@@ -277,7 +277,7 @@ def create_summary_plot(dataset_dir):
     plt.tight_layout()
     plot_path = dataset_dir / "validation_summary.png"
     plt.savefig(plot_path, dpi=150, bbox_inches='tight')
-    print(f"📊 Summary plot saved: {plot_path}")
+    print(f"Summary plot saved: {plot_path}")
     plt.close()
 
 def main():
@@ -289,7 +289,7 @@ def main():
     
     for dataset_dir in datasets:
         if not dataset_dir.exists():
-            print(f"⚠️  Dataset not found: {dataset_dir}")
+            print(f"WARNING: Dataset not found: {dataset_dir}")
             continue
             
         print(f"\n{'='*60}")
@@ -303,7 +303,7 @@ def main():
         validate_parameters(dataset_dir)
         create_summary_plot(dataset_dir)
         
-        print(f"\n✅ Validation complete for {dataset_dir}")
+        print(f"\nOK: Validation complete for {dataset_dir}")
 
 if __name__ == "__main__":
     main()

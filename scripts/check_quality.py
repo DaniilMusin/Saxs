@@ -275,8 +275,11 @@ def check_dataset_balance(dataset_dir: Path) -> Dict:
     
     # Check for missing files
     missing_files = []
-    for uid in df['uid']:
-        curve_file = dataset_dir / 'saxs' / f'{uid:06d}.dat'
+    for idx, row in df.iterrows():
+        uid = row['uid']
+        # Use actual filename from metadata if available
+        filename = row['filename'] if 'filename' in df.columns and pd.notna(row['filename']) else f'{uid:06d}.dat'
+        curve_file = dataset_dir / 'saxs' / filename
         if not curve_file.exists():
             missing_files.append(uid)
     

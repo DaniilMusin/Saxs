@@ -73,4 +73,12 @@ htmlcov/
 # mypy
 .mypy_cache/
 .dmypy.json
-dmypy.json
+dmypy.json# Large datasets - excluded from git
+corrected_dataset_full_*/
+dataset_all_shapes_*/
+*_sample_*/
+*.png
+*.jpg
+test_*/
+atsas_*/
+backup_*/
